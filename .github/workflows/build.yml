@@ -1,1 +1,106 @@
+import os
+import threading
+import html
+import zipfile
+import uuid
+from datetime import datetime
 
+# Kivy / Mobile UI
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.clock import Clock
+from kivy.utils import platform
+
+# Engine (Pure Python fallback for stability, using PyPDF)
+# We use pypdf as it is the most stable for GitHub Actions builds
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+# --- THE ENGINE ---
+class SingularityEngine:
+    """The core logic for PDF to ePub transformation."""
+    
+    @staticmethod
+    def convert(pdf_path, output_dir, callback):
+        try:
+            if not PdfReader:
+                callback("Error: pypdf library missing.")
+                return
+
+            callback("Reading PDF...")
+            reader = PdfReader(pdf_path)
+            title = reader.metadata.title or "Converted Book"
+            author = reader.metadata.author or "Singularity"
+            
+            chapters = []
+            for i, page in enumerate(reader.pages):
+                callback(f"Processing Page {i+1}...")
+                text = html.escape(page.extract_text())
+                # Wrap text in paragraphs
+                formatted_text = "".join([f"<p>{p}</p>" for p in text.split('\n') if p.strip()])
+                chapters.append({"title": f"Page {i+1}", "content": formatted_text})
+
+            callback("Packing ePub...")
+            out_file = os.path.join(output_dir, "Singularity_Book.epub")
+            SingularityEngine.pack_epub(title, author, chapters, out_file)
+            callback(f"DONE: Saved to {out_file}")
+            
+        except Exception as e:
+            callback(f"Critical Error: {str(e)}")
+
+    @staticmethod
+    def pack_epub(title, author, chapters, output_path):
+        uid = str(uuid.uuid4())
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+            zf.writestr("META-INF/container.xml", '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
+            
+            manifest, spine = [], []
+            for i, chap in enumerate(chapters):
+                fname, fid = f"ch{i}.xhtml", f"id{i}"
+                content = f'<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{chap["title"]}</title></head><body><h1>{chap["title"]}</h1>{chap["content"]}</body></html>'
+                zf.writestr(f"OEBPS/{fname}", content)
+                manifest.append(f'<item id="{fid}" href="{fname}" media-type="application/xhtml+xml"/>')
+                spine.append(f'<itemref idref="{fid}"/>')
+
+            opf = f'<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator><dc:identifier id="uid">urn:uuid:{uid}</dc:identifier></metadata><manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>{"".join(manifest)}</manifest><spine toc="ncx">{"".join(spine)}</spine></package>'
+            zf.writestr("OEBPS/content.opf", opf)
+            zf.writestr("OEBPS/toc.ncx", f'<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="urn:uuid:{uid}"/></head><docTitle><text>{title}</text></docTitle><navMap></navMap></ncx>')
+
+# --- THE UI ---
+class SingularityApp(App):
+    def build(self):
+        layout = BoxLayout(orientation='vertical', padding=30, spacing=20)
+        self.status = Label(text="Forge Ready", font_size='18sp')
+        self.path_input = TextInput(hint_text="Paste PDF path here", multiline=False, size_hint_y=None, height=100)
+        btn = Button(text="FORGE EPUB", background_color=(0, 0.7, 1, 1), size_hint_y=None, height=120)
+        btn.bind(on_press=self.start_forge)
+        
+        layout.add_widget(Label(text="SINGULARITY CONVERTER", font_size='24sp', bold=True))
+        layout.add_widget(self.path_input)
+        layout.add_widget(btn)
+        layout.add_widget(self.status)
+        return layout
+
+    def start_forge(self, instance):
+        pdf_path = self.path_input.text.strip()
+        if not os.path.exists(pdf_path):
+            self.status.text = "Error: File not found!"
+            return
+        
+        self.status.text = "Starting Engine..."
+        # Running in thread to keep UI alive
+        output_dir = "/storage/emulated/0/Download" if platform == 'android' else os.path.dirname(pdf_path)
+        threading.Thread(target=SingularityEngine.convert, args=(pdf_path, output_dir, self.update_status)).start()
+
+    def update_status(self, msg):
+        def _set(dt): self.status.text = msg
+        Clock.schedule_once(_set)
+
+if __name__ == '__main__':
+    SingularityApp().run()
